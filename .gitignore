@@ -2,3 +2,5 @@
 store/
 trained_network/
 Auto_Driving_Highway/MY_KEY.txt
+*.db
+*.pyc
