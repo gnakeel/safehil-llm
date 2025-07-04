@@ -18,9 +18,8 @@ from cpprb import PrioritizedReplayBuffer
 
 class DRL(object):
     def __init__(self, seed, action_dim, state_dim, pstate_dim, policy_type, critic_type, 
-                 LR_A = 1e-3, LR_C = 1e-3, LR_ALPHA=1e-4, BUFFER_SIZE=int(2e5), 
-                 TAU=5e-3, GAMMA = 0.99, ALPHA=0.05, POLICY_GUIDANCE=False,
-                 VALUE_GUIDANCE = False, ADAPTIVE_CONFIDENCE = True,
+                 LR_A = 1e-3, LR_C = 1e-3, LR_ALPHA=1e-4, BUFFER_SIZE=int(2e5), BATCH_SIZE=64,
+                 TAU=5e-3, GAMMA = 0.99, ALPHA=0.05, POLICY_GUIDANCE=False, ADAPTIVE_CONFIDENCE = True,
                  automatic_entropy_tuning=True):
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -34,6 +33,8 @@ class DRL(object):
         self.lr_a = LR_A
         self.lr_c = LR_C
         self.lr_alpha = LR_ALPHA
+        self.buffer_size = BUFFER_SIZE
+        self.batch_size = BATCH_SIZE
         self.tau = TAU
         self.alpha = ALPHA
         self.itera = 0
@@ -41,7 +42,6 @@ class DRL(object):
         self.engage_weight = 1.0 #IARL 2.0, others 1.0
         self.buffer_size_expert = 5e3
         self.p_guidance = POLICY_GUIDANCE
-        self.v_guidance = VALUE_GUIDANCE
         self.p_loss = 0.0
         self.engage_loss = 0.0
         self.adaptive_weight = ADAPTIVE_CONFIDENCE
@@ -58,7 +58,7 @@ class DRL(object):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        self.replay_buffer = PrioritizedReplayBuffer(BUFFER_SIZE,
+        self.replay_buffer = PrioritizedReplayBuffer(self.buffer_size,
                                           {"obs": {"shape": (100,100,9),"dtype": np.uint8},
                                            "pobs": {"shape":pstate_dim},
                                            "act": {"shape":action_dim},
@@ -106,7 +106,7 @@ class DRL(object):
 
         return action.detach().squeeze(0).cpu().numpy()
 
-    def learn_guidence(self, batch_size=64):
+    def learn_guidence(self):
         agent_buffer_size = self.replay_buffer.get_stored_size()
 
         ###### For prior demonstration ######
@@ -115,9 +115,9 @@ class DRL(object):
             scale_factor = 1
             # total_size = agent_buffer_size + exp_buffer_size
             
-            self.batch_expert = min(np.floor(exp_buffer_size/agent_buffer_size * batch_size / scale_factor), batch_size)
+            self.batch_expert = min(np.floor(exp_buffer_size/agent_buffer_size * self.batch_size / scale_factor), self.batch_size)
 
-            batch_agent = batch_size
+            batch_agent = self.batch_size
         
         if self.batch_expert > 0:
             demonstration_flag = True
@@ -145,7 +145,7 @@ class DRL(object):
         ###### For non prior demonstration #####
         else:
             demonstration_flag = False
-            data = self.replay_buffer.sample(batch_size)
+            data = self.replay_buffer.sample(self.batch_size)
             istates, pstates, actions = data['obs'], data['pobs'], data['act']
             rewards, next_istates = data['rew'], data['next_obs']
             next_pstates, dones = data['next_pobs'], data['done']
@@ -250,9 +250,9 @@ class DRL(object):
         self.itera += 1
         return qf1_loss.item(), policy_loss.item()
 
-    def learn(self, batch_size=64):
+    def learn(self):
         # Sample a batch from memory
-        data = self.replay_buffer.sample(batch_size)
+        data = self.replay_buffer.sample(self.batch_size)
         istates, pstates, actions = data['obs'], data['pobs'], data['act']
         rewards, next_istates = data['rew'], data['next_obs']
         next_pstates, dones = data['next_pobs'], data['done']

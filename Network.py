@@ -7,7 +7,7 @@ Created on Thu Jun  8 16:29:35 2023
 """
 
 import sys
-sys.path.append('/home/oscar/Dropbox/Human-in-the-loop-RL')
+sys.path.append('/home/kang/code/safehil-llm/SMARTS')
 
 import torch
 import torch.nn as nn

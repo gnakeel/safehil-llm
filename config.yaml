@@ -26,9 +26,10 @@ LR_ALPHA : 0.0005
 
 ##### Environment ######
 AGENT_ID : 'SafeHiL'
-env_name : 'v0'
-# scenario_path : 'scenario/straight_with_left_turn_v1'
-scenario_path : 'scenario/v0'
+# env_name : 'v0'
+env_name : 'straight'
+scenario_path : 'scenario/straight_with_left_turn_v1'
+# scenario_path : 'scenario/v0'
 screen_size : 100
 view : 50
 condition_state_dim : 2

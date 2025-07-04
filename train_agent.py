@@ -5,7 +5,9 @@ import yaml
 import time
 import torch
 import warnings
+import statistics
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 from itertools import count
 from collections import deque
@@ -35,6 +37,7 @@ from customTools import (
 from analysis_obs import available_action, get_available_lanes, get_involved_cars, extract_lanes_info, extract_lane_and_car_ids, assess_lane_change_safety, check_safety_in_current_lane, format_training_info
 import ask_llm as ask_llm
 from ask_llm import ACTIONS_ALL
+from utils import extract_decision
 
 from drl_agent import DRL
 from keyboard import HumanKeyboardAgent
@@ -42,10 +45,16 @@ from utils_ import soft_update, hard_update
 from authority_allocation import Arbitrator
 from main import observation_adapter, action_adapter, reward_adapter
 
+from custom_ws import WebSocketClient 
+import logging
+import asyncio
+
+
 class MyHiWayEnv(gym.Env):
     def __init__(self, screen_size, scenario_path, agent_specs, seed, vehicleCount,
                  observation_space, action_space, agent_id,
-                 headless=False, visdom=False, sumo_headless=True):
+                 headless=False, visdom=False, sumo_headless=True,
+                 websocket_client: WebSocketClient = None):
         super(MyHiWayEnv, self).__init__()
         
         self.screen_size = screen_size
@@ -73,41 +82,63 @@ class MyHiWayEnv(gym.Env):
             seed=self.seed
         )
 
-    def step(self, action):
-        # Step the wrapped environment and capture all returned values
-        meta_state, reward, done, truncated = self.env.step(action)
+        self._ws_client = websocket_client 
+        if self._ws_client is None:
+            logging.warning("MyHiWayEnv initialized without a WebSocketClient. No data will be sent via WebSocket.")
+
+    async def step(self, action):
+        # 연결 준비 대기
+        if self._ws_client:
+            await self._ws_client.wait_until_connected()
+
+        # 안전 마스크
+        ego_state = self.meta_state.ego_vehicle_state
+        lane_id = ego_state.lane_index
+        if ego_state.speed >= self.meta_state.waypoint_paths[lane_id][0].speed_limit and action[0] > 0.0:
+            action = list(action)
+            action[0] = 0.0
+            action = tuple(action)
+        
+        meta_state, reward, done, truncated = self.env.step({self.agent_id: action})
+        done = done[self.agent_id]
         self.meta_state = meta_state[self.agent_id]
         obs = self.observation_adapter(self.meta_state)
+
         self.last_observation = obs
-        custom_reward = self.calculate_custom_reward(tuple(action.values())[0])
+
+        action_name, _ = ask_llm.get_action_info(action)
+
+        if self._ws_client:
+            message_to_send = {
+                "agent_id": self.agent_id,
+                "agent_action": action_name,
+                "llm_action": self.llm_action,
+                "timestamp": time.time()
+            }
+            try:
+                await asyncio.wait_for(self._ws_client.send_message(message_to_send), timeout=2.0)
+            except asyncio.TimeoutError:
+                logging.error("[MyHiWayEnv] WebSocket send timeout. Skipping send.")
+
+        custom_reward = self.calculate_custom_reward(action_name)
 
         return obs, custom_reward, done, truncated
 
     def set_llm_suggested_action(self, action):
-        self.llm_suggested_action = action
+        self.llm_action = action
     
-    def calculate_custom_reward(self, action):
-        action_name, _ = ask_llm.get_action_info(action)
-        llm_action = self.llm_suggested_action
-    
-        # 정확히 일치하는 경우
-        if action_name in llm_action:
+    def calculate_custom_reward(self, action_name):
+        if action_name in self.llm_action:
             reward = 1.0
             print(f"✅ 액션 일치! 보상: {reward}")
             return reward
     
-        # 부분적으로 유사한 경우 (속도 관련 액션)
         speed_actions = ["FASTER", "SLOWER"]
-        if (action_name in speed_actions and llm_action in speed_actions):
+        if action_name in speed_actions and self.llm_action in speed_actions:
             reward = 0.3
             print(f"⚠️ 액션 부분 일치! 보상: {reward}")
             return reward
 
-        if hasattr(self, '_debug_step') and self._debug_step:
-            if action_name in llm_action:
-                print(f"✅ 액션 일치! 보상: {reward}")
-        
-        # 일치하지 않는 경우
         print(f"❌ 액션 불일치! 보상: 0")
         return 0.0
     
@@ -116,8 +147,6 @@ class MyHiWayEnv(gym.Env):
         self.states[:, :, 0:3] = self.states[:, :, 3:6]
         self.states[:, :, 3:6] = self.states[:, :, 6:9]
         self.states[:, :, 6:9] = new_obs
-        ogm = meta_state.occupancy_grid_map[1] 
-        drivable_area = meta_state.drivable_area_grid_map[1]
 
         if meta_state.events.collisions or meta_state.events.reached_goal:
             self.states = np.zeros(shape=(self.screen_size, self.screen_size, 9), dtype=np.float32)
@@ -133,48 +162,205 @@ class MyHiWayEnv(gym.Env):
         return state
     
     def get_available_actions(self):
-        """Get the list of available actions from the underlying Highway environment."""
-        sce = Scenario(vehicleCount=self.vehicleCount)
-        sce.updateVehicles(self.meta_state, 0)
+        self.sce = Scenario(vehicleCount=self.vehicleCount)
+        self.sce.updateVehicles(self.meta_state, 0)
 
-        toolModels = [
+        self.toolModels = [
             getAvailableActions(self.env.unwrapped),
-            getAvailableLanes(sce),
-            getLaneInvolvedCar(sce),
-            isChangeLaneConflictWithCar(sce),
-            isAccelerationConflictWithCar(sce),
-            isKeepSpeedConflictWithCar(sce),
-            isDecelerationSafe(sce),
-    ]
+            getAvailableLanes(self.sce),
+            getLaneInvolvedCar(self.sce),
+            isChangeLaneConflictWithCar(self.sce),
+            isAccelerationConflictWithCar(self.sce),
+            isKeepSpeedConflictWithCar(self.sce),
+            isDecelerationSafe(self.sce),
+        ]
 
-        available = available_action(toolModels)
+        available = available_action(self.toolModels)
         valid_action_ids = [i for i, act in ACTIONS_ALL.items() if available.get(act, False)]
         return valid_action_ids
+    
+    async def __aenter__(self):
+        if self._ws_client:
+            await self._ws_client.connect()
+            await self._ws_client.wait_until_connected()
+        return self
 
-def train(env, agent, sce, toolModels):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._ws_client:
+            await self._ws_client.disconnect()
+        self.env.close()
+
+
+async def evaluate(env, agent, eval_episodes=10, epoch=0):
+    ep = 0
+    success = 0
+    avg_reward_list = []
+    lane_center = [-3.2, 0, 3.2]
+    
+    v_list_avg = []
+    offset_list_avg = []
+    dist_list_avg = []
+
+    engage = int(0)
+    
+    while ep < eval_episodes:
+        done = False
+        reward_total = 0.0 
+        frame_skip = 5
+        
+        action_list = deque(maxlen=1)
+        action_list.append(np.array([0.0, 0.0]))
+
+        s = env.reset()
+        obs = env.meta_state
+        initial_pos = obs.ego_vehicle_state.position[:2]
+        pos_list = deque(maxlen=5)
+        pos_list.append(initial_pos)
+
+        df = pd.DataFrame([])
+        s_list = []
+        l_list = []
+        offset_list = []
+        v_list = []
+        steer_list = []
+
+        for t in count():
+            if t > MAX_NUM_STEPS:
+                print('Max Steps Done.')
+                break
+
+            ##### Select and perform an action #####
+            a = agent.choose_action(s[0], action_list[-1], evaluate=True)
+            action = action_adapter(a)
+            
+            llm_suggested_action = 'RIGHT'
+            print(f"llm action: {llm_suggested_action}")
+
+            env.set_llm_suggested_action(llm_suggested_action)
+
+            s_, custom_reward, done, info = await env.step(action)
+            print(f"Reward: {custom_reward}\n")
+
+            obs = env.meta_state
+            ego_state = obs.ego_vehicle_state
+            curr_pos = ego_state.position[:2]
+            print(ego_state.speed)
+            
+            if env_name == 'straight' and (curr_pos[0] - initial_pos[0]) > 200:
+                done = True
+                print('Done')
+            elif env_name == 'straight_with_turn' and (curr_pos[1] - initial_pos[1]) > 98:
+                done = True
+                print('Done')
+            
+            r = reward_adapter(obs, pos_list, a, engage=engage, done=done)
+            pos_list.append(curr_pos)
+            
+            reward_total += r + custom_reward
+            action_list.append(a)
+            s = s_
+            
+            l = ego_state.lane_position.t + lane_center[ego_state.lane_index]
+            s_list.append(ego_state.lane_position.s)
+            l_list.append(l)
+            v_list.append(ego_state.speed)
+            steer_list.append(a[-1])
+    
+            ####### G29 Interface ######
+            # pygame.event.get()
+            # print('g29!')
+            # steering = 0
+            # if js.get_button(4):
+            #     steering = 0.1
+            #     if js.get_button(10):
+            #         steering *= 1.5
+            # elif js.get_button(5):
+            #     steering = -0.1
+            #     if js.get_button(11):
+            #         steering *= 1.5
+            # time.sleep(0.2)
+            # action = {AGENT_ID:((-js.get_axis(2)+1)/2,(-js.get_axis(3)+1)/2, steering)} # G29 test
+            # print(action)
+            
+            if human.slow_down:
+                time.sleep(1/40)
+            
+            if done:
+                if not info[AGENT_ID]['env_obs'].events.off_road and \
+                    not info[AGENT_ID]['env_obs'].events.collisions:
+                    success += 1
+                
+                print('\n|Epoc:', ep,
+                      '\n|Step:', t,
+                      '\n|Collision:', bool(len(info[AGENT_ID]['env_obs'].events.collisions)),
+                      '\n|Off Road:', info[AGENT_ID]['env_obs'].events.off_road,
+                      '\n|Goal:', info[AGENT_ID]['env_obs'].events.reached_goal,
+                      '\n|Off Route:', info[AGENT_ID]['env_obs'].events.off_route,
+                      '\n|R:', reward_total,
+                      '\n|Algo:', name,
+                      '\n|seed:', seed,
+                      '\n|Env:', env_name)
+                
+                df["s"] = s_list
+                df["l"] = l_list
+                df["v"] = v_list
+                df["steer"] = steer_list
+                
+                df.to_csv('./store/' + env_name + '/data_%s_%s' % (name, ep) + '.csv', index=0)
+                
+                break
+            
+        ep += 1
+        v_list_avg.append(np.mean(v_list))
+        offset_list_avg.append(np.mean(offset_list))
+        dist_list_avg.append(curr_pos[0] - initial_pos[0])
+        avg_reward_list.append(reward_total)
+        print("\n..............................................")
+        print("%i Loop, Steps: %i, Avg Reward: %f, Success No. : %i " % (ep, t, reward_total, success))
+        print("..............................................")
+
+    reward = statistics.mean(avg_reward_list)
+    print("\n..............................................")
+    print("Average Reward over %i Evaluation Episodes, At Epoch: %i, Avg Reward:%f, Success No.: %i" % (eval_episodes, ep, reward, success))
+    print("..............................................")
+        
+    return reward, v_list_avg, offset_list_avg, dist_list_avg, avg_reward_list
+    
+async def train(env, agent):
     save_threshold = 3.0
     trigger_reward = 3.0
     trigger_epoc = 400
     saved_epoc = 1
     epoc = 0
     pbar = tqdm(total=MAX_NUM_EPOC)
-    frame = 0
+    frame = 1
+
+    arbitrator = Arbitrator()
+    arbitrator.shared_control = SHARED_CONTROL
+
+    _ = env.reset()
+    _ = env.get_available_actions()
+    toolModels = env.toolModels
     
     while epoc <= MAX_NUM_EPOC:
         reward_total = 0.0 
         error = 0.0 
-        action_list = deque(maxlen=1)
-        action_list.append(np.array([0.0, 0.0]))
-        guidance_count = int(0)
+        guidance_count = 0
         guidance_rate = 0.0
         frame_skip = 5
+
+        action_list = deque(maxlen=1)
+        action_list.append(np.array([0.0, 0.0]))
+
+        reward_list = []
+        reward_mean_list = []
         
         continuous_threshold = 100
         intermittent_threshold = 300
         
         pos_list = deque(maxlen=5)
         s = env.reset()
-        obs = env.envs[0].meta_state
+        obs = env.meta_state
         initial_pos = obs.ego_vehicle_state.position[:2]
         pos_list.append(initial_pos)
 
@@ -183,7 +369,7 @@ def train(env, agent, sce, toolModels):
                 print('Max Steps Done.')
                 break
             
-            sce.updateVehicles(obs, frame)
+            env.sce.updateVehicles(obs, frame)
             # Observation translation
             msg0 = available_action(toolModels)
             msg1 = get_available_lanes(toolModels)
@@ -198,7 +384,7 @@ def train(env, agent, sce, toolModels):
             formatted_info = format_training_info(msg0, msg1, msg2, lanes_info, lane_car_ids, safety_assessment, lane_change_safety, safety_msg)
 
             ##### Select and perform an action ######
-            rl_a = agent.choose_action(s[0], action_list[-1])
+            rl_a = agent.choose_action(s, action_list[-1])
             guidance = False
 
             ##### Human-in-the-loop #######
@@ -231,36 +417,19 @@ def train(env, agent, sce, toolModels):
 
             ##### Interaction #####
             action = action_adapter(a)
-            
-            ##### Safety Mask #####
-            ego_state = obs.ego_vehicle_state
-            lane_id = ego_state.lane_index
-            if ego_state.speed >= obs.waypoint_paths[lane_id][0].speed_limit and\
-               action[0] > 0.0:
-                   action = list(action)
-                   action[0] = 0.0
-                   action = tuple(action)
 
-            # llm_response = ask_llm.send_to_chatgpt(action, formatted_info, sce)
-            # decision_content = llm_response.content
-            # print(llm_response)
-            # llm_suggested_action = extract_decision(decision_content)
-            llm_suggested_action = 'FASTER'
+            llm_response = ask_llm.send_to_chatgpt(action, formatted_info, env.sce)
+            decision_content = llm_response.content
+            llm_suggested_action = extract_decision(decision_content)
+            # llm_suggested_action = 'RIGHT'
             print(f"llm action: {llm_suggested_action}")
 
-            env.env_method('set_llm_suggested_action', llm_suggested_action)
-            # print(f"Action: {action}")
-            # print(f"Observation: {next_obs}")
+            env.set_llm_suggested_action(llm_suggested_action)
 
-            action = {AGENT_ID:action}
-
-            s_, custom_reward, done, info = env.step([action])
-            custom_reward = custom_reward[0]
-            done = done[0]
-            info = info[0]
+            s_, custom_reward, done, info = await env.step(action)
             print(f"Reward: {custom_reward}\n")
 
-            obs = env.envs[0].meta_state
+            obs = env.meta_state
             curr_pos = obs.ego_vehicle_state.position[:2]
             
             if env_name == 'straight' and (curr_pos[0] - initial_pos[0]) > 200:
@@ -271,20 +440,22 @@ def train(env, agent, sce, toolModels):
                 print('Done')
             
             r = reward_adapter(obs, pos_list, a, engage=engage, done=done)
+            r += custom_reward
+            
             pos_list.append(curr_pos)
 
             ##### Store the transition in memory ######
             agent.store_transition(s, action_list[-1], a, human_a, r,
                                    s_, a, engage, authority, done)
             
-            reward_total += r + custom_reward
+            reward_total += r
             action_list.append(a)
             s = s_
             frame += 1
                             
             if epoc >= THRESHOLD:   
                 # Train the DRL model
-                agent.learn_guidence(BATCH_SIZE)
+                agent.learn_guidence()
 
             if human.slow_down:
                 time.sleep(1/40)
@@ -305,14 +476,11 @@ def train(env, agent, sce, toolModels):
                             print('Save the model at %i epoch, reward is: %f' % (epoc, avg_reward))
                             saved_epoc = epoc
                             
-                            torch.save(agent.policy.state_dict(), os.path.join('trained_network/' + env_name,
-                                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                                      + str(seed)+'_'+env_name+'_actornet.pkl'))
-                            torch.save(agent.critic.state_dict(), os.path.join('trained_network/' + env_name,
-                                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                                      + str(seed)+'_'+env_name+'_criticnet.pkl'))
+                            torch.save(agent.policy.state_dict(), set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_actornetwork.pkl',
+                                                                           agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
+
+                            torch.save(agent.critic.state_dict(),  set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_criticnetwork.pkl',
+                                                                           agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
                             save_threshold = avg_reward
 
                 print('\n|Epoc:', epoc,
@@ -339,57 +507,41 @@ def train(env, agent, sce, toolModels):
         #     plot_animation_figure(saved_epoc)
     
         if (epoc % SAVE_INTERVAL == 0):
-            np.save(os.path.join('store/' + env_name, 'reward_memo'+str(MEMORY_CAPACITY) +
-                                      '_epoc'+str(MAX_NUM_EPOC)+'_step' + str(MAX_NUM_STEPS) +
-                                      '_seed'+ str(seed) +'_'+env_name+'_' + name),
+            np.save(set_path(path='store/'+env_name, prefix='reward', suffix=env_name+'_'+name,
+                             agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS),
                     [reward_mean_list], allow_pickle=True, fix_imports=True)
 
     pbar.close()
     print('Complete')
-    return save_threshold
+    return save_threshold, reward_mean_list
 
-# utils.py
-def extract_decision(response_content):
-    try:
-        import re
-        pattern = r'"decision":\s*{\s*"([^"]+)"\s*}'
-        match = re.search(pattern, response_content)
-        if match:
-            raw_decision = match.group(1).upper().strip()
-            
-            # 매핑 사전
-            decision_map = {
-                "ACCELERATE": "FASTER",
-                "SPEED UP": "FASTER",
-                "GO FASTER": "FASTER",
-                "DECELERATE": "SLOWER",
-                "SLOW DOWN": "SLOWER",
-                "BRAKE": "SLOWER",
-                "STAY": "IDLE",
-                "MAINTAIN": "IDLE",
-                "KEEP": "IDLE",
-                "LEFT": "LANE_LEFT",
-                "CHANGE LEFT": "LANE_LEFT",
-                "RIGHT": "LANE_RIGHT",
-                "CHANGE RIGHT": "LANE_RIGHT"
-            }
-            
-            # 매핑 시도
-            if raw_decision in {'FASTER', 'SLOWER', 'LEFT', 'IDLE', 'RIGHT'}:
-                return raw_decision  # 이미 올바른 형식
-            else:
-                mapped = decision_map.get(raw_decision)
-                print(f"LLM 응답 '{raw_decision}'을(를) '{mapped}'(으)로 매핑")
-                return mapped
-        
-        print(f"결정 패턴을 찾을 수 없음: {response_content}")
-        return None
-    except Exception as e:
-        print(f"결정 추출 중 오류: {e}")
-        return None
+def set_agent(env, channel, config, mode_param):
 
+    agent = DRL(
+        seed=env.seed,
+        action_dim=env.action_space.high.size,
+        state_dim=channel,
+        pstate_dim=config['condition_state_dim'],
+        policy_type=config['ACTOR_TYPE'],
+        critic_type=config['CRITIC_TYPE'],
+        LR_A=config['LR_ACTOR'],
+        LR_C=config['LR_CRITIC'],
+        BUFFER_SIZE=config['MEMORY_CAPACITY'],
+        BATCH_SIZE=config['BATCH_SIZE'],
+        TAU=config['TAU'],
+        GAMMA=config['GAMMA'],
+        ALPHA=config['ALPHA'],
+        POLICY_GUIDANCE=mode_param['POLICY_GUIDANCE'],
+        ADAPTIVE_CONFIDENCE=mode_param['ADAPTIVE_CONFIDENCE'],
+        automatic_entropy_tuning=config['ENTROPY']
+    )
 
+    return agent
 
+def set_path(path, prefix, suffix, agent, num_epoc, num_steps):
+
+    return os.path.join(path,
+            f'{prefix}_memo{agent.buffer_size}_epoc{num_epoc}_step{num_steps}_seed{agent.seed}_{suffix}')
 
 if __name__ == "__main__":
 
@@ -407,10 +559,6 @@ if __name__ == "__main__":
     model = 'SAC'
     mode_param = config[model]
     name = mode_param['name']
-    POLICY_GUIDANCE = mode_param['POLICY_GUIDANCE']
-    VALUE_GUIDANCE = mode_param['VALUE_GUIDANCE']
-    PENALTY_GUIDANCE = mode_param['PENALTY_GUIDANCE']
-    ADAPTIVE_CONFIDENCE = mode_param['ADAPTIVE_CONFIDENCE']
     
     if model != 'SAC':
         SHARED_CONTROL = mode_param['SHARED_CONTROL']
@@ -421,33 +569,20 @@ if __name__ == "__main__":
         
     ###### Default parameters for DRL ######
     mode = config['mode']
-    ACTOR_TYPE = config['ACTOR_TYPE']
-    CRITIC_TYPE = config['CRITIC_TYPE']
-    LR_ACTOR = config['LR_ACTOR']
-    LR_CRITIC = config['LR_CRITIC']
-    TAU = config['TAU']
     THRESHOLD = config['THRESHOLD']
     TARGET_UPDATE = config['TARGET_UPDATE']
-    BATCH_SIZE = config['BATCH_SIZE']
-    GAMMA = config['GAMMA']
-    MEMORY_CAPACITY = config['MEMORY_CAPACITY']
     MAX_NUM_EPOC = config['MAX_NUM_EPOC']
     MAX_NUM_STEPS = config['MAX_NUM_STEPS']
     PLOT_INTERVAL = config['PLOT_INTERVAL']
     SAVE_INTERVAL = config['SAVE_INTERVAL']
     EVALUATION_EPOC = config['EVALUATION_EPOC']
+    VALUE_GUIDANCE = mode_param['VALUE_GUIDANCE'],
 
-    ###### Entropy ######
-    ENTROPY = config['ENTROPY']
-    LR_ALPHA = config['LR_ALPHA']
-    ALPHA = config['ALPHA']
-    
     ###### Env Settings #######
     env_name = config['env_name']
     scenario = config['scenario_path']
     screen_size = config['screen_size']
     view = config['view']
-    condition_state_dim = config['condition_state_dim']
     AGENT_ID = config['AGENT_ID']
     
     # Create the network storage folders
@@ -457,139 +592,132 @@ if __name__ == "__main__":
     if not os.path.exists("./trained_network/" + env_name):
         os.makedirs("./trained_network/" + env_name)
 
+    #### Environment specs ####
+    ACTION_SPACE = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,))
+    OBSERVATION_SPACE = gym.spaces.Box(low=0, high=1, shape=(screen_size, screen_size, 9))
+    states = np.zeros(shape=(screen_size, screen_size, 9), dtype=np.float32)
+
+    ##### Define agent interface #######
+    agent_interface = AgentInterface(
+        max_episode_steps=MAX_NUM_STEPS,
+        waypoints=Waypoints(50),
+        neighborhood_vehicles=NeighborhoodVehicles(radius=100),
+        rgb=RGB(screen_size, screen_size, view/screen_size),
+        ogm=OGM(screen_size, screen_size, view/screen_size),
+        drivable_area_grid_map=DrivableAreaGridMap(screen_size, screen_size, view/screen_size),
+        action=ActionSpaceType.Continuous,
+    )
+
+    ###### Define agent specs ######
+    agent_spec = AgentSpec(
+        interface=agent_interface,
+        # observation_adapter=observation_adapter,
+        # reward_adapter=reward_adapter,
+        # action_adapter=action_adapter,
+        # info_adapter=info_adapter,
+    )
+    
+    ######## Human Intervention through g29 or keyboard ########
+    human = HumanKeyboardAgent()
+
+    ##### Set Env ######
+    if model == 'SAC':
+        envisionless = True
+    else:
+        envisionless = False
+
+    img_h, img_w, channel = screen_size, screen_size, 9
+    physical_state_dim = 2
+    n_obs = img_h * img_w * channel
+
+    ##### WebSocket URI #####
+    WEBSOCKET_URI = 'ws://localhost:8082/actions'
+
     ##### Train #####
-    for i in range(1, 2):
-        seed = i
+    _scenario_path = [scenario]
+    _screen_size = screen_size
+    _agent_specs = {AGENT_ID: agent_spec}
+    _vehicle_count = 5
+    _obs_space = OBSERVATION_SPACE
+    _action_space = ACTION_SPACE
+    _agent_id = AGENT_ID
+    async def run_training(seed):
+        async with WebSocketClient(uri=WEBSOCKET_URI) as ws:
+            async with MyHiWayEnv(
+                screen_size=_screen_size,
+                scenario_path=_scenario_path,
+                agent_specs=_agent_specs,
+                seed=seed if mode != 'evaluation' else -1,
+                vehicleCount=_vehicle_count,
+                observation_space=_obs_space,
+                action_space=_action_space,
+                agent_id=_agent_id,
+                headless=False,
+                visdom=False,
+                sumo_headless=True,
+                websocket_client=ws
+            ) as env:
 
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+                agent = set_agent(env, channel, config, mode_param)
 
-        #### Environment specs ####
-        ACTION_SPACE = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,))
-        OBSERVATION_SPACE = gym.spaces.Box(low=0, high=1, shape=(screen_size, screen_size, 9))
-        states = np.zeros(shape=(screen_size, screen_size, 9), dtype=np.float32)
-    
-        ##### Define agent interface #######
-        agent_interface = AgentInterface(
-            max_episode_steps=MAX_NUM_STEPS,
-            waypoints=Waypoints(50),
-            neighborhood_vehicles=NeighborhoodVehicles(radius=100),
-            rgb=RGB(screen_size, screen_size, view/screen_size),
-            ogm=OGM(screen_size, screen_size, view/screen_size),
-            drivable_area_grid_map=DrivableAreaGridMap(screen_size, screen_size, view/screen_size),
-            action=ActionSpaceType.Continuous,
-        )
-        
-        ###### Define agent specs ######
-        agent_spec = AgentSpec(
-            interface=agent_interface,
-            # observation_adapter=observation_adapter,
-            # reward_adapter=reward_adapter,
-            # action_adapter=action_adapter,
-            # info_adapter=info_adapter,
-        )
-        
-        ######## Human Intervention through g29 or keyboard ########
-        human = HumanKeyboardAgent()
-        
-        ##### Create Env ######
-        if model == 'SAC':
-            envisionless = True
-        else:
-            envisionless = False
-        
-        scenario_path = [scenario]
-        env = MyHiWayEnv(screen_size, scenario_path, agent_specs={AGENT_ID: agent_spec},
-                       headless=False, visdom=False, sumo_headless=True, seed=seed, vehicleCount=5,
-                       observation_space = OBSERVATION_SPACE, action_space = ACTION_SPACE, agent_id = AGENT_ID)
-        env = DummyVecEnv([lambda: env])
+                print(f'''
+                        The object is: {model}
+                        |Seed: {agent.seed} 
+                        |VALUE_GUIDANCE: {mode_param['VALUE_GUIDANCE']}
+                        |PENALTY_GUIDANCE: {mode_param['PENALTY_GUIDANCE']}
+                        ''')
+                
+                success_count = 0
 
-        obs = env.reset()
-        img_h, img_w, channel = screen_size, screen_size, 9
-        physical_state_dim = 2
-        n_obs = img_h * img_w * channel
-        n_actions = env.action_space.high.size
-        
-        legend_bar = []
-        
-        # Initialize the agent
-        agent = DRL(seed, n_actions, channel, condition_state_dim, ACTOR_TYPE, CRITIC_TYPE,
-                    LR_ACTOR, LR_CRITIC, LR_ALPHA, MEMORY_CAPACITY, TAU,
-                    GAMMA, ALPHA, POLICY_GUIDANCE, VALUE_GUIDANCE,
-                    ADAPTIVE_CONFIDENCE, ENTROPY)
-        
-        arbitrator = Arbitrator()
-        arbitrator.shared_control = SHARED_CONTROL
+                if mode == 'evaluation':
+                    name = 'sac'
+                    max_epoc = 820
+                    max_steps = 300
+                    # directory =  'best_candidate'
+                    
+                    filename = set_path('trained_network/'+env_name, name, env_name+'_actornet.pkl', agent, max_epoc, max_steps)
+                            
+                    agent.policy.load_state_dict(torch.load(filename))
+                    agent.policy.eval()
+                    reward, v_list_avg, offset_list_avg, dist_list_avg, avg_reward_list = await evaluate(env, agent, eval_episodes=10)
+                    
+                    print(f'''
+                            |Avg Speed: {np.mean(v_list_avg)}
+                            |Std Speed: {np.std(v_list_avg)}
+                            |Avg Dist: {np.mean(dist_list_avg)}
+                            |Std Dist: {np.std(dist_list_avg)}
+                            |Avg Offset: {np.mean(offset_list_avg)}
+                            |Std Offset: {np.std(offset_list_avg)}
+                            ''')
 
-        sce = Scenario(vehicleCount=5)
-        toolModels = [
-            getAvailableActions(env.envs[0]),
-            getAvailableLanes(sce),
-            getLaneInvolvedCar(sce),
-            isChangeLaneConflictWithCar(sce),
-            isAccelerationConflictWithCar(sce),
-            isKeepSpeedConflictWithCar(sce),
-            isDecelerationSafe(sce),
-            # isActionSafe()
-        ]
-    
-        train(env, agent, sce, toolModels)
-        
-        legend_bar.append('seed'+str(seed))
-        
-        train_durations = []
-        train_durations_mean_list = []
-        reward_list = []
-        reward_mean_list = []
-        guidance_list = []
-
-        
-        print('\nThe object is:', model, '\n|Seed:', agent.seed, 
-             '\n|VALUE_GUIDANCE:', VALUE_GUIDANCE, '\n|PENALTY_GUIDANCE:', PENALTY_GUIDANCE,'\n')
-        
-        success_count = 0
-
-        if mode == 'evaluation':
-            name = 'sac'
-            max_epoc = 820
-            max_steps = 300
-            seed = 4
-            directory = 'trained_network/' + env_name
-            # directory =  'best_candidate'
-            filename = name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+ \
-                      str(max_epoc) + '_step' + str(max_steps) + \
-                      '_seed' + str(seed) + '_' + env_name
-                      
-            agent.policy.load_state_dict(torch.load('%s/%s_actornet.pkl' % (directory, filename)))
-            agent.policy.eval()
-            reward, v_list_avg, offset_list_avg, dist_list_avg, avg_reward_list = evaluate(env, agent, eval_episodes=10)
+                else:
+                    save_threshold, reward_mean_list = await train(env, agent)
+                
+                    np.save(set_path(path='store/'+env_name, prefix='reward', suffix=env_name+'_'+name,
+                                    agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS),
+                            [reward_mean_list], allow_pickle=True, fix_imports=True)
             
-            print('\n|Avg Speed:', np.mean(v_list_avg),
-                  '\n|Std Speed:', np.std(v_list_avg),
-                  '\n|Avg Dist:', np.mean(dist_list_avg),
-                  '\n|Std Dist:', np.std(dist_list_avg),
-                  '\n|Avg Offset:', np.mean(offset_list_avg),
-                  '\n|Std Offset:', np.std(offset_list_avg))
+                    torch.save(agent.policy.state_dict(), set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_actornet_final.pkl',
+                            agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
+                    
+                    
+                    torch.save(agent.critic.state_dict(), set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_criticnet_final.pkl',
+                            agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
 
-        else:
-            save_threshold = train(success_count)
-        
-            np.save(os.path.join('store/' + env_name, 'reward_memo'+str(MEMORY_CAPACITY) +
-                                      '_epoc'+str(MAX_NUM_EPOC)+'_step' + str(MAX_NUM_STEPS) +
-                                      '_seed'+ str(seed) +'_'+env_name+'_' + name),
-                    [reward_mean_list], allow_pickle=True, fix_imports=True)
-    
-            torch.save(agent.policy.state_dict(), os.path.join('trained_network/' + env_name,
-                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                      + str(seed)+'_'+env_name+'_actornet_final.pkl'))
-            torch.save(agent.critic.state_dict(), os.path.join('trained_network/' + env_name,
-                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                      + str(seed)+'_'+env_name+'_criticnet_final.pkl'))
+    try:
+        for i in range(1, 2):
+            seed = i
 
-        env.close()
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            asyncio.run(run_training(seed))
+
+    except KeyboardInterrupt:
+        logging.info("Training stopped by user (KeyboardInterrupt).")
+    except Exception as e:
+        logging.critical(f"An unhandled error occurred during training: {e}", exc_info=True)

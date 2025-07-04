@@ -6,6 +6,10 @@ Created on Thu Jun  8 16:02:04 2023
 @author: oscar
 """
 
+import asyncio
+from custom_ws import WebSocketClient
+import logging
+
 import os
 import gym
 import sys
@@ -23,7 +27,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 
 # sys.path.append('/home/oscar/Dropbox/SMARTS')
-sys.path.append('/home/kang/code/Safe-Human-in-the-Loop-RL/SMARTS')
+sys.path.append('/home/kang/code/rndix/safehil-llm/SMARTS')
 from smarts.core.agent import AgentSpec
 from smarts.env.hiway_env import HiWayEnv
 from smarts.core.controllers import ActionSpaceType
@@ -361,7 +365,7 @@ def action_adapter(action):
 def info_adapter(observation, reward, info):
     return info
 
-def interaction(COUNTER):
+async def train(env, agent, ws):
     save_threshold = 3.0
     trigger_reward = 3.0
     trigger_epoc = 400
@@ -395,33 +399,36 @@ def interaction(COUNTER):
                 break
 
             ##### Select and perform an action ######
-            rl_a = agent.choose_action(np.array(s), action_list[-1])
+            # rl_a = agent.choose_action(np.array(s), action_list[-1])
+            rl_a = np.array([0.0, 0.0]) #x
             guidance = False
             
             ##### Human-in-the-loop #######
-            if model != 'SAC' and human.intervention and epoc <= INTERMITTENT_THRESHOLD:
-                human_action = human.act()
-                guidance = True
-            else:
-                human_a = np.array([0.0, 0.0])
+            # if model != 'SAC' and human.intervention and epoc <= INTERMITTENT_THRESHOLD:
+            #     human_action = human.act()
+            #     guidance = True
+            # else:
+            #     human_a = np.array([0.0, 0.0])
+            human_a = np.array([0.0, 0.0])
             
             ###### Assign final action ######
-            if guidance:
-                if human_action[1] > human.MIN_BRAKE:
-                    human_a = np.array([-human_action[1], human_action[-1]])
-                else:
-                    human_a = np.array([human_action[0], human_action[-1]])
+            # if guidance:
+            #     if human_action[1] > human.MIN_BRAKE:
+            #         human_a = np.array([-human_action[1], human_action[-1]])
+            #     else:
+            #         human_a = np.array([human_action[0], human_action[-1]])
                 
-                if arbitrator.shared_control and epoc > CONTINUAL_THRESHOLD:
-                    rl_authority, human_authority = arbitrator.authority(obs, rl_a, human_a)
-                    a = rl_authority * rl_a + human_authority * human_a
-                else:
-                    a = human_a
-                    human_authority = 1.0 #np.array([1.0, 1.0])
-                engage = int(1)
-                authority = human_authority
-                guidance_count += int(1)
-            else:
+            #     if arbitrator.shared_control and epoc > CONTINUAL_THRESHOLD:
+            #         rl_authority, human_authority = arbitrator.authority(obs, rl_a, human_a)
+            #         a = rl_authority * rl_a + human_authority * human_a
+            #     else:
+            #         a = human_a
+            #         human_authority = 1.0 #np.array([1.0, 1.0])
+            #     engage = int(1)
+            #     authority = human_authority
+            #     guidance_count += int(1)
+            # else:
+            if True: #x
                 a = rl_a
                 engage = int(0)
                 authority = 0.0 
@@ -437,6 +444,18 @@ def interaction(COUNTER):
                    action = list(action)
                    action[0] = 0.0
                    action = tuple(action)
+
+            if ws:
+                message_to_send = {
+                    "agent_id": AGENT_ID,
+                    "agent_action": 'test',
+                    "llm_action": 'test',
+                    "timestamp": time.time()
+                }
+                try:
+                    await asyncio.wait_for(ws.send_message(message_to_send), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logging.error("[MyHiWayEnv] WebSocket send timeout. Skipping send.")
                        
             action = {AGENT_ID:action}
             next_state, reward, done, info = env.step(action)
@@ -472,43 +491,43 @@ def interaction(COUNTER):
 
             if done:
                 epoc += 1
-                if epoc > THRESHOLD:
-                    reward_list.append(max(-15.0, reward_total))
-                    reward_mean_list.append(np.mean(reward_list[-10:]))
+                # if epoc > THRESHOLD:
+                #     reward_list.append(max(-15.0, reward_total))
+                #     reward_mean_list.append(np.mean(reward_list[-10:]))
                 
-                    ###### Evaluating the performance of current model ######
-                    if reward_mean_list[-1] >= trigger_reward and epoc > trigger_epoc:
-                        # trigger_reward = reward_mean_list[-1]
-                        print("Evaluating the Performance.")
-                        avg_reward, _, _, _, _ = evaluate(env, agent, EVALUATION_EPOC)
-                        trigger_reward = avg_reward
-                        if avg_reward > save_threshold:
-                            print('Save the model at %i epoch, reward is: %f' % (epoc, avg_reward))
-                            saved_epoc = epoc
+                #     ###### Evaluating the performance of current model ######
+                #     if reward_mean_list[-1] >= trigger_reward and epoc > trigger_epoc:
+                #         # trigger_reward = reward_mean_list[-1]
+                #         print("Evaluating the Performance.")
+                #         avg_reward, _, _, _, _ = evaluate(env, agent, EVALUATION_EPOC)
+                #         trigger_reward = avg_reward
+                #         if avg_reward > save_threshold:
+                #             print('Save the model at %i epoch, reward is: %f' % (epoc, avg_reward))
+                #             saved_epoc = epoc
                             
-                            torch.save(agent.policy.state_dict(), os.path.join('trained_network/' + env_name,
-                                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                                      + str(seed)+'_'+env_name+'_actornet.pkl'))
-                            torch.save(agent.critic.state_dict(), os.path.join('trained_network/' + env_name,
-                                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                                      + str(seed)+'_'+env_name+'_criticnet.pkl'))
-                            save_threshold = avg_reward
+                #             torch.save(agent.policy.state_dict(), os.path.join('trained_network/' + env_name,
+                #                       name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
+                #                       str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
+                #                       + str(seed)+'_'+env_name+'_actornet.pkl'))
+                #             torch.save(agent.critic.state_dict(), os.path.join('trained_network/' + env_name,
+                #                       name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
+                #                       str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
+                #                       + str(seed)+'_'+env_name+'_criticnet.pkl'))
+                #             save_threshold = avg_reward
 
-                print('\n|Epoc:', epoc,
-                      '\n|Step:', t,
-                      '\n|Goal:', info[AGENT_ID]['env_obs'].events.reached_goal,
-                      '\n|Guidance Rate:', guidance_rate, '%',
-                      '\n|Collision:', bool(len(info[AGENT_ID]['env_obs'].events.collisions)),
-                      '\n|Off Road:', info[AGENT_ID]['env_obs'].events.off_road,
-                      '\n|Off Route:', info[AGENT_ID]['env_obs'].events.off_route,
-                      '\n|R:', reward_total,
-                      '\n|Temperature:', agent.alpha,
-                      '\n|Reward Threshold:', save_threshold,
-                      '\n|Algo:', name,
-                      '\n|seed:', seed,
-                      '\n|Env:', env_name)
+                # print('\n|Epoc:', epoc,
+                #       '\n|Step:', t,
+                #       '\n|Goal:', info[AGENT_ID]['env_obs'].events.reached_goal,
+                #       '\n|Guidance Rate:', guidance_rate, '%',
+                #       '\n|Collision:', bool(len(info[AGENT_ID]['env_obs'].events.collisions)),
+                #       '\n|Off Road:', info[AGENT_ID]['env_obs'].events.off_road,
+                #       '\n|Off Route:', info[AGENT_ID]['env_obs'].events.off_route,
+                #       '\n|R:', reward_total,
+                #       '\n|Temperature:', agent.alpha,
+                #       '\n|Reward Threshold:', save_threshold,
+                #       '\n|Algo:', name,
+                #       '\n|seed:', seed,
+                #       '\n|Env:', env_name)
     
                 s = env.reset()
                 reward_total = 0
@@ -519,16 +538,44 @@ def interaction(COUNTER):
         # if epoc % PLOT_INTERVAL == 0:
         #     plot_animation_figure(saved_epoc)
     
-        if (epoc % SAVE_INTERVAL == 0):
-            np.save(os.path.join('store/' + env_name, 'reward_memo'+str(MEMORY_CAPACITY) +
-                                      '_epoc'+str(MAX_NUM_EPOC)+'_step' + str(MAX_NUM_STEPS) +
-                                      '_seed'+ str(seed) +'_'+env_name+'_' + name),
-                    [reward_mean_list], allow_pickle=True, fix_imports=True)
+        # if (epoc % SAVE_INTERVAL == 0):
+        #     np.save(os.path.join('store/' + env_name, 'reward_memo'+str(MEMORY_CAPACITY) +
+        #                               '_epoc'+str(MAX_NUM_EPOC)+'_step' + str(MAX_NUM_STEPS) +
+        #                               '_seed'+ str(seed) +'_'+env_name+'_' + name),
+        #             [reward_mean_list], allow_pickle=True, fix_imports=True)
             
-            pass
+        #     pass
     pbar.close()
     print('Complete')
     return save_threshold
+
+def set_agent(env, channel, config, mode_param):
+
+    agent = DRL(
+        seed=env.seed,
+        action_dim=env.action_space.high.size,
+        state_dim=channel,
+        pstate_dim=config['condition_state_dim'],
+        policy_type=config['ACTOR_TYPE'],
+        critic_type=config['CRITIC_TYPE'],
+        LR_A=config['LR_ACTOR'],
+        LR_C=config['LR_CRITIC'],
+        BUFFER_SIZE=config['MEMORY_CAPACITY'],
+        BATCH_SIZE=config['BATCH_SIZE'],
+        TAU=config['TAU'],
+        GAMMA=config['GAMMA'],
+        ALPHA=config['ALPHA'],
+        POLICY_GUIDANCE=mode_param['POLICY_GUIDANCE'],
+        ADAPTIVE_CONFIDENCE=mode_param['ADAPTIVE_CONFIDENCE'],
+        automatic_entropy_tuning=config['ENTROPY']
+    )
+
+    return agent
+
+def set_path(path, prefix, suffix, agent, num_epoc, num_steps):
+
+    return os.path.join(path,
+            f'{prefix}_memo{agent.buffer_size}_epoc{num_epoc}_step{num_steps}_seed{agent.seed}_{suffix}')
 
 if __name__ == "__main__":
 
@@ -546,10 +593,6 @@ if __name__ == "__main__":
     model = 'SAC'
     mode_param = config[model]
     name = mode_param['name']
-    POLICY_GUIDANCE = mode_param['POLICY_GUIDANCE']
-    VALUE_GUIDANCE = mode_param['VALUE_GUIDANCE']
-    PENALTY_GUIDANCE = mode_param['PENALTY_GUIDANCE']
-    ADAPTIVE_CONFIDENCE = mode_param['ADAPTIVE_CONFIDENCE']
     
     if model != 'SAC':
         SHARED_CONTROL = mode_param['SHARED_CONTROL']
@@ -560,33 +603,20 @@ if __name__ == "__main__":
         
     ###### Default parameters for DRL ######
     mode = config['mode']
-    ACTOR_TYPE = config['ACTOR_TYPE']
-    CRITIC_TYPE = config['CRITIC_TYPE']
-    LR_ACTOR = config['LR_ACTOR']
-    LR_CRITIC = config['LR_CRITIC']
-    TAU = config['TAU']
     THRESHOLD = config['THRESHOLD']
     TARGET_UPDATE = config['TARGET_UPDATE']
-    BATCH_SIZE = config['BATCH_SIZE']
-    GAMMA = config['GAMMA']
-    MEMORY_CAPACITY = config['MEMORY_CAPACITY']
     MAX_NUM_EPOC = config['MAX_NUM_EPOC']
     MAX_NUM_STEPS = config['MAX_NUM_STEPS']
     PLOT_INTERVAL = config['PLOT_INTERVAL']
     SAVE_INTERVAL = config['SAVE_INTERVAL']
     EVALUATION_EPOC = config['EVALUATION_EPOC']
+    VALUE_GUIDANCE = mode_param['VALUE_GUIDANCE'],
 
-    ###### Entropy ######
-    ENTROPY = config['ENTROPY']
-    LR_ALPHA = config['LR_ALPHA']
-    ALPHA = config['ALPHA']
-    
     ###### Env Settings #######
     env_name = config['env_name']
     scenario = config['scenario_path']
     screen_size = config['screen_size']
     view = config['view']
-    condition_state_dim = config['condition_state_dim']
     AGENT_ID = config['AGENT_ID']
     
     # Create the network storage folders
@@ -596,127 +626,121 @@ if __name__ == "__main__":
     if not os.path.exists("./trained_network/" + env_name):
         os.makedirs("./trained_network/" + env_name)
 
+    #### Environment specs ####
+    ACTION_SPACE = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,))
+    OBSERVATION_SPACE = gym.spaces.Box(low=0, high=1, shape=(screen_size, screen_size, 9))
+    states = np.zeros(shape=(screen_size, screen_size, 9), dtype=np.float32)
+
+    ##### Define agent interface #######
+    agent_interface = AgentInterface(
+        max_episode_steps=MAX_NUM_STEPS,
+        waypoints=Waypoints(50),
+        neighborhood_vehicles=NeighborhoodVehicles(radius=100),
+        rgb=RGB(screen_size, screen_size, view/screen_size),
+        ogm=OGM(screen_size, screen_size, view/screen_size),
+        drivable_area_grid_map=DrivableAreaGridMap(screen_size, screen_size, view/screen_size),
+        action=ActionSpaceType.Continuous,
+    )
+
+    ###### Define agent specs ######
+    agent_spec = AgentSpec(
+        interface=agent_interface,
+        # observation_adapter=observation_adapter,
+        # reward_adapter=reward_adapter,
+        # action_adapter=action_adapter,
+        # info_adapter=info_adapter,
+    )
+    
+    ######## Human Intervention through g29 or keyboard ########
+    human = HumanKeyboardAgent()
+
+    ##### Set Env ######
+    if model == 'SAC':
+        envisionless = True
+    else:
+        envisionless = False
+
+    img_h, img_w, channel = screen_size, screen_size, 9
+    physical_state_dim = 2
+    n_obs = img_h * img_w * channel
+
+    ##### WebSocket URI #####
+    WEBSOCKET_URI = 'ws://localhost:8082/actions'
+
     ##### Train #####
-    for i in range(1, 2):
-        seed = i
-
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-        #### Environment specs ####
-        ACTION_SPACE = gym.spaces.Box(low=-1.0, high=1.0, shape=(2,))
-        OBSERVATION_SPACE = gym.spaces.Box(low=0, high=1, shape=(screen_size, screen_size, 9))
-        states = np.zeros(shape=(screen_size, screen_size, 9))
-    
-        ##### Define agent interface #######
-        agent_interface = AgentInterface(
-            max_episode_steps=MAX_NUM_STEPS,
-            waypoints=Waypoints(50),
-            neighborhood_vehicles=NeighborhoodVehicles(radius=100),
-            rgb=RGB(screen_size, screen_size, view/screen_size),
-            ogm=OGM(screen_size, screen_size, view/screen_size),
-            drivable_area_grid_map=DrivableAreaGridMap(screen_size, screen_size, view/screen_size),
-            action=ActionSpaceType.Continuous,
-        )
-        
-        ###### Define agent specs ######
-        agent_spec = AgentSpec(
-            interface=agent_interface,
-            # observation_adapter=observation_adapter,
-            # reward_adapter=reward_adapter,
-            # action_adapter=action_adapter,
-            # info_adapter=info_adapter,
-        )
-        
-        ######## Human Intervention through g29 or keyboard ########
-        human = HumanKeyboardAgent()
-        
-        ##### Create Env ######
-        if model == 'SAC':
-            envisionless = True
-        else:
-            envisionless = False
-        
-        scenario_path = [scenario]
-        env = HiWayEnv(scenarios=scenario_path, agent_specs={AGENT_ID: agent_spec},
+    _scenario_path = [scenario]
+    _screen_size = screen_size
+    _agent_specs = {AGENT_ID: agent_spec}
+    _vehicle_count = 5
+    _obs_space = OBSERVATION_SPACE
+    _action_space = ACTION_SPACE
+    _agent_id = AGENT_ID
+    async def run_training(seed):
+        async with WebSocketClient(uri=WEBSOCKET_URI) as ws:
+            env = HiWayEnv(scenarios=_scenario_path, agent_specs=_agent_specs,
                        headless=False, visdom=False, sumo_headless=True, seed=seed)
-        env.observation_space = OBSERVATION_SPACE
-        env.action_space = ACTION_SPACE
-        env.agent_id = AGENT_ID
-        env.seed = seed
+            env.seed = seed
+            env.action_space = _action_space
+            agent = set_agent(env, channel, config, mode_param)
 
-        obs = env.reset()
-        img_h, img_w, channel = screen_size, screen_size, 9
-        physical_state_dim = 2
-        n_obs = img_h * img_w * channel
-        n_actions = env.action_space.high.size
-        
-        legend_bar = []
-        
-        # Initialize the agent
-        agent = DRL(seed, n_actions, channel, condition_state_dim, ACTOR_TYPE, CRITIC_TYPE,
-                    LR_ACTOR, LR_CRITIC, LR_ALPHA, MEMORY_CAPACITY, TAU,
-                    GAMMA, ALPHA, POLICY_GUIDANCE, VALUE_GUIDANCE,
-                    ADAPTIVE_CONFIDENCE, ENTROPY)
-        
-        arbitrator = Arbitrator()
-        arbitrator.shared_control = SHARED_CONTROL
-        
-        legend_bar.append('seed'+str(seed))
-        
-        train_durations = []
-        train_durations_mean_list = []
-        reward_list = []
-        reward_mean_list = []
-        guidance_list = []
-
-        
-        print('\nThe object is:', model, '\n|Seed:', agent.seed, 
-             '\n|VALUE_GUIDANCE:', VALUE_GUIDANCE, '\n|PENALTY_GUIDANCE:', PENALTY_GUIDANCE,'\n')
-        
-        success_count = 0
-
-        if mode == 'evaluation':
-            name = 'sac'
-            max_epoc = 820
-            max_steps = 300
-            seed = 4
-            directory = 'trained_network/' + env_name
-            # directory =  'best_candidate'
-            filename = name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+ \
-                      str(max_epoc) + '_step' + str(max_steps) + \
-                      '_seed' + str(seed) + '_' + env_name
-                      
-            agent.policy.load_state_dict(torch.load('%s/%s_actornet.pkl' % (directory, filename)))
-            agent.policy.eval()
-            reward, v_list_avg, offset_list_avg, dist_list_avg, avg_reward_list = evaluate(env, agent, eval_episodes=10)
+            print(f'''
+                    The object is: {model}
+                    |Seed: {agent.seed} 
+                    |VALUE_GUIDANCE: {mode_param['VALUE_GUIDANCE']}
+                    |PENALTY_GUIDANCE: {mode_param['PENALTY_GUIDANCE']}
+                    ''')
             
-            print('\n|Avg Speed:', np.mean(v_list_avg),
-                  '\n|Std Speed:', np.std(v_list_avg),
-                  '\n|Avg Dist:', np.mean(dist_list_avg),
-                  '\n|Std Dist:', np.std(dist_list_avg),
-                  '\n|Avg Offset:', np.mean(offset_list_avg),
-                  '\n|Std Offset:', np.std(offset_list_avg))
+            success_count = 0
 
-        else:
-            save_threshold = interaction(success_count)
+            if mode == 'evaluation':
+                name = 'sac'
+                max_epoc = 820
+                max_steps = 300
+                # directory =  'best_candidate'
+                
+                filename = set_path('trained_network/'+env_name, name, env_name+'_actornet.pkl', agent, max_epoc, max_steps)
+                        
+                agent.policy.load_state_dict(torch.load(filename))
+                agent.policy.eval()
+                reward, v_list_avg, offset_list_avg, dist_list_avg, avg_reward_list = await evaluate(env, agent, eval_episodes=10)
+                
+                print(f'''
+                        |Avg Speed: {np.mean(v_list_avg)}
+                        |Std Speed: {np.std(v_list_avg)}
+                        |Avg Dist: {np.mean(dist_list_avg)}
+                        |Std Dist: {np.std(dist_list_avg)}
+                        |Avg Offset: {np.mean(offset_list_avg)}
+                        |Std Offset: {np.std(offset_list_avg)}
+                        ''')
+
+            else:
+                save_threshold, reward_mean_list = await train(env, agent, ws)
+            
+                np.save(set_path(path='store/'+env_name, prefix='reward', suffix=env_name+'_'+name,
+                                agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS),
+                        [reward_mean_list], allow_pickle=True, fix_imports=True)
         
-            np.save(os.path.join('store/' + env_name, 'reward_memo'+str(MEMORY_CAPACITY) +
-                                      '_epoc'+str(MAX_NUM_EPOC)+'_step' + str(MAX_NUM_STEPS) +
-                                      '_seed'+ str(seed) +'_'+env_name+'_' + name),
-                    [reward_mean_list], allow_pickle=True, fix_imports=True)
-    
-            torch.save(agent.policy.state_dict(), os.path.join('trained_network/' + env_name,
-                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                      + str(seed)+'_'+env_name+'_actornet_final.pkl'))
-            torch.save(agent.critic.state_dict(), os.path.join('trained_network/' + env_name,
-                      name+'_memo'+str(MEMORY_CAPACITY)+'_epoc'+
-                      str(MAX_NUM_EPOC) + '_step' + str(MAX_NUM_STEPS) + '_seed'
-                      + str(seed)+'_'+env_name+'_criticnet_final.pkl'))
+                torch.save(agent.policy.state_dict(), set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_actornet_final.pkl',
+                        agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
+                
+                
+                torch.save(agent.critic.state_dict(), set_path(path='trained_network'+env_name, prefix=name, suffix=env_name+'_criticnet_final.pkl',
+                        agent=agent, num_epoc=MAX_NUM_EPOC, num_steps=MAX_NUM_STEPS))
 
-        env.close()
+    try:
+        for i in range(1, 2):
+            seed = i
+
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+            asyncio.run(run_training(seed))
+
+    except KeyboardInterrupt:
+        logging.info("Training stopped by user (KeyboardInterrupt).")
+    except Exception as e:
+        logging.critical(f"An unhandled error occurred during training: {e}", exc_info=True)

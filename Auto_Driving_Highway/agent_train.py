@@ -18,6 +18,7 @@ from customTools import (
 )
 from analysis_obs import available_action, get_available_lanes, get_involved_cars, extract_lanes_info, extract_lane_and_car_ids, assess_lane_change_safety, check_safety_in_current_lane, format_training_info
 import ask_llm
+from utils import extract_decision
 
 ACTIONS_ALL = {
     0: 'LANE_LEFT',
@@ -182,20 +183,6 @@ def main():
         print(f"Reward: {rewards}\n")
 
     env.close()
-
-# utils.py
-def extract_decision(response_content):
-    try:
-        start = response_content.find('"decision": {') + len('"decision": {')
-        end = response_content.find('}', start)
-        decision = response_content[start:end].strip('"')
-        return decision
-    except Exception as e:
-        print(f"Error in extracting decision: {e}")
-        return None
-
-
-
 
 if __name__ == "__main__":
     main()
